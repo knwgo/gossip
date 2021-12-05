@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: memberlist
+  namespace: default
+spec:
+  replicas: 6
+  selector:
+    matchLabels:
+      app: memberlist
+  serviceName: memberlist
+  template:
+    metadata:
+      labels:
+        app: memberlist
+    spec:
+      containers:
+        - args:
+            - -members
+            - memberlist-0.memberlist:33333,memberlist-1.memberlist:33333,memberlist-2.memberlist:33333,memberlist-3.memberlist:33333,memberlist-4.memberlist:33333,memberlist-5.memberlist:33333
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: status.podIP
+          image: kaynwong/memberlist:latest
+          imagePullPolicy: Always
+          name: memberlist
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

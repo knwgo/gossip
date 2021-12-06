@@ -17,18 +17,20 @@ import (
 var (
 	mtx        sync.RWMutex
 	members    = flag.String("members", "", "comma separated list of members")
-	local      = state{Items: map[string]string{}}
+	local      []entry
 	broadcasts *memberlist.TransmitLimitedQueue
 )
 
-type state struct {
-	Items map[string]string `json:"items"`
-	//Counter int               `json:"counter"`
+
+type entry struct {
+	Id       string
+	Key, Val string
+	Expired  time.Time
 }
 
 type update struct {
-	Action string // set, del
-	Data   map[string]string
+	Action string // add, del
+	Data   []entry
 }
 
 func init() {
@@ -65,32 +67,42 @@ func (d *delegate) NotifyMsg(b []byte) {
 	switch b[0] {
 	case 'd': // data
 		fmt.Println("receive user data")
-		var updates []*update
+		var updates []update
 		if err := json.Unmarshal(b[1:], &updates); err != nil {
 			fmt.Println(err)
 			return
 		}
 		mtx.Lock()
 		for _, u := range updates {
-			for k, v := range u.Data {
+			for i := range u.Data {
 				switch u.Action {
-				case "set":
-					fmt.Println("receive set event")
-					if v != local.Items[k] {
+				case "add":
+					fmt.Println("receive add event")
+					if !contain(local, u.Data[i].Id) {
+						local = append(local, u.Data[i])
 						broadcasts.QueueBroadcast(&broadcast{
 							msg: b,
 						})
 					}
-					local.Items[k] = v
 				case "del":
 					fmt.Println("receive del event")
-					_, ok := local.Items[k]
-					if ok {
-						broadcasts.QueueBroadcast(&broadcast{
-							msg: b,
-						})
+					var changed bool
+					if contain(local, u.Data[i].Id) {
+						for i := range local {
+							if local[i].Id == u.Data[i].Id {
+								if !local[i].Expired.IsZero() && local[i].Expired.Before(time.Now()) {
+									continue
+								}
+								local[i].Expired = u.Data[i].Expired
+								changed = true
+							}
+						}
+						if changed {
+							broadcasts.QueueBroadcast(&broadcast{
+								msg: b,
+							})
+						}
 					}
-					delete(local.Items, k)
 				}
 			}
 		}
@@ -115,21 +127,26 @@ func (d *delegate) MergeRemoteState(buf []byte, join bool) {
 		return
 	}
 
-	if join {
-		fmt.Println("join merge remote state")
-	} else {
-		fmt.Println("push/pull merge remote state")
-	}
-
-	var m state
-	if err := json.Unmarshal(buf, &m); err != nil {
+	var remote []entry
+	if err := json.Unmarshal(buf, &remote); err != nil {
 		return
 	}
 	mtx.Lock()
-	for k, v := range m.Items {
-		local.Items[k] = v
+	for i := range remote {
+		if !contain(local, remote[i].Id) {
+			local = append(local, remote[i])
+		}
 	}
 	mtx.Unlock()
+}
+
+func contain(et []entry, s string) bool {
+	for _, e := range et {
+		if e.Id == s {
+			return true
+		}
+	}
+	return false
 }
 
 type eventDelegate struct{}
@@ -146,20 +163,24 @@ func (ed *eventDelegate) NotifyUpdate(node *memberlist.Node) {
 	fmt.Println("A node was updated: " + node.String())
 }
 
-func setHandler(w http.ResponseWriter, r *http.Request) {
+func addHandler(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	key := r.Form.Get("key")
 	val := r.Form.Get("val")
 	mtx.Lock()
-	local.Items[key] = val
+	add := entry{
+		Id:      uuid.NewUUID().String(),
+		Key:     key,
+		Val:     val,
+		Expired: time.Time{},
+	}
+	local = append(local, add)
 	mtx.Unlock()
 
-	b, err := json.Marshal([]*update{
+	b, err := json.Marshal([]update{
 		{
-			Action: "set",
-			Data: map[string]string{
-				key: val,
-			},
+			Action: "add",
+			Data:   []entry{add},
 		},
 	})
 
@@ -176,15 +197,20 @@ func setHandler(w http.ResponseWriter, r *http.Request) {
 func delHandler(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	key := r.Form.Get("key")
+	now := time.Now()
+	var deleted []entry
 	mtx.Lock()
-	delete(local.Items, key)
+	for i := range local {
+		if local[i].Key == key {
+			local[i].Expired = now
+			deleted = append(deleted, local[i])
+		}
+	}
 	mtx.Unlock()
 
-	b, err := json.Marshal([]*update{{
+	b, err := json.Marshal([]update{{
 		Action: "del",
-		Data: map[string]string{
-			key: "",
-		},
+		Data:   deleted,
 	}})
 
 	if err != nil {
@@ -200,10 +226,18 @@ func delHandler(w http.ResponseWriter, r *http.Request) {
 func getHandler(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	key := r.Form.Get("key")
+	var val []string
 	mtx.RLock()
-	val := local.Items[key]
+	for i := range local {
+		if local[i].Key == key {
+			expireTime := local[i].Expired
+			if expireTime.IsZero() || expireTime.After(time.Now()) {
+				val = append(val, local[i].Val)
+			}
+		}
+	}
 	mtx.RUnlock()
-	_, _ = w.Write([]byte(val))
+	_, _ = w.Write([]byte(strings.Join(val, ",")))
 }
 
 func start() (*memberlist.Memberlist, error) {
@@ -240,13 +274,13 @@ func start() (*memberlist.Memberlist, error) {
 }
 
 func main() {
-	m, err := start()
+	_, err := start()
 	if err != nil {
 		fmt.Println(err)
 	}
-	go printMembersStatus(m)
+	go printMembersStatus()
 
-	http.HandleFunc("/set", setHandler)
+	http.HandleFunc("/add", addHandler)
 	http.HandleFunc("/del", delHandler)
 	http.HandleFunc("/get", getHandler)
 	if err := http.ListenAndServe(":4396", nil); err != nil {
@@ -254,13 +288,13 @@ func main() {
 	}
 }
 
-func printMembersStatus(m *memberlist.Memberlist) {
+func printMembersStatus() {
 	tick := time.NewTicker(time.Second * 10)
 	for {
 		select {
 		case <-tick.C:
 			fmt.Println(strings.Repeat("#", 50))
-			fmt.Println(local.Items)
+			fmt.Println(local)
 			fmt.Println(strings.Repeat("#", 50))
 		}
 	}

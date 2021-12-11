@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"net/http"
 	"os"
 	"strings"
@@ -12,28 +11,33 @@ import (
 
 	"github.com/hashicorp/memberlist"
 	"github.com/pborman/uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 var (
 	mtx        sync.RWMutex
 	members    = flag.String("members", "", "comma separated list of members")
-	local      []entry
-	broadcasts *memberlist.TransmitLimitedQueue
+	local      = state{}
+	broadcasts memberlist.TransmitLimitedQueue
 )
 
+type state map[string]*entry
 
 type entry struct {
-	Id       string
 	Key, Val string
-	Expired  time.Time
+	Deleted  bool
 }
 
 type update struct {
-	Action string // add, del
-	Data   []entry
+	Action string
+	Data   []state
 }
 
 func init() {
+	log.SetFormatter(&log.TextFormatter{
+		ForceColors: true,
+	})
+	log.SetLevel(log.DebugLevel)
 	flag.Parse()
 }
 
@@ -60,54 +64,50 @@ func (d *delegate) NodeMeta(_ int) []byte {
 }
 
 func (d *delegate) NotifyMsg(b []byte) {
-	if len(b) == 0 {
+	if len(b) == 0 || b[0] != 'd' {
 		return
 	}
 
-	switch b[0] {
-	case 'd': // data
-		fmt.Println("receive user data")
-		var updates []update
-		if err := json.Unmarshal(b[1:], &updates); err != nil {
-			fmt.Println(err)
-			return
-		}
-		mtx.Lock()
-		for _, u := range updates {
-			for i := range u.Data {
-				switch u.Action {
-				case "add":
-					fmt.Println("receive add event")
-					if !contain(local, u.Data[i].Id) {
-						local = append(local, u.Data[i])
-						broadcasts.QueueBroadcast(&broadcast{
-							msg: b,
-						})
-					}
-				case "del":
-					fmt.Println("receive del event")
-					var changed bool
-					if contain(local, u.Data[i].Id) {
-						for i := range local {
-							if local[i].Id == u.Data[i].Id {
-								if !local[i].Expired.IsZero() && local[i].Expired.Before(time.Now()) {
-									continue
-								}
-								local[i].Expired = u.Data[i].Expired
-								changed = true
-							}
-						}
-						if changed {
-							broadcasts.QueueBroadcast(&broadcast{
-								msg: b,
-							})
-						}
-					}
+	var u update
+	if err := json.Unmarshal(b[1:], &u); err != nil {
+		log.Error(err)
+		return
+	}
+	mtx.Lock()
+	switch u.Action {
+	case "add":
+		log.Info("receive add event")
+		for i := range u.Data {
+			for id := range u.Data[i] {
+				if _, ok := local[id]; !ok {
+					local[id] = u.Data[i][id]
+					broadcasts.QueueBroadcast(&broadcast{
+						msg: b,
+					})
 				}
 			}
 		}
-		mtx.Unlock()
+	case "del":
+		log.Info("receive del event")
+		var changed bool
+		for _, data := range u.Data {
+			for id := range data {
+				if _, ok := local[id]; ok {
+					if local[id].Deleted {
+						continue
+					}
+					local[id].Deleted = true
+					changed = true
+				}
+			}
+		}
+		if changed {
+			broadcasts.QueueBroadcast(&broadcast{
+				msg: b,
+			})
+		}
 	}
+	mtx.Unlock()
 }
 
 func (d *delegate) GetBroadcasts(overhead, limit int) [][]byte {
@@ -123,44 +123,42 @@ func (d *delegate) LocalState(_ bool) []byte {
 }
 
 func (d *delegate) MergeRemoteState(buf []byte, join bool) {
+	_ = join
+
 	if len(buf) == 0 {
 		return
 	}
 
-	var remote []entry
+	remote := map[string]*entry{}
 	if err := json.Unmarshal(buf, &remote); err != nil {
+		log.Error(err)
 		return
 	}
 	mtx.Lock()
-	for i := range remote {
-		if !contain(local, remote[i].Id) {
-			local = append(local, remote[i])
+	for id := range remote {
+		if entry, ok := local[id]; !ok {
+			local[id] = entry
+		} else {
+			if !local[id].Deleted && remote[id].Deleted {
+				local[id].Deleted = true
+			}
 		}
 	}
 	mtx.Unlock()
 }
 
-func contain(et []entry, s string) bool {
-	for _, e := range et {
-		if e.Id == s {
-			return true
-		}
-	}
-	return false
-}
-
 type eventDelegate struct{}
 
 func (ed *eventDelegate) NotifyJoin(node *memberlist.Node) {
-	fmt.Println("A node has joined: " + node.String())
+	log.Infof("a node has joined: %s", node.String())
 }
 
 func (ed *eventDelegate) NotifyLeave(node *memberlist.Node) {
-	fmt.Println("A node has left: " + node.String())
+	log.Warningf("a node has left: %s", node.String())
 }
 
 func (ed *eventDelegate) NotifyUpdate(node *memberlist.Node) {
-	fmt.Println("A node was updated: " + node.String())
+	log.Warningf("a node was updated: %s", node.String())
 }
 
 func addHandler(w http.ResponseWriter, r *http.Request) {
@@ -168,20 +166,18 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.Form.Get("key")
 	val := r.Form.Get("val")
 	mtx.Lock()
-	add := entry{
-		Id:      uuid.NewUUID().String(),
+	add := &entry{
 		Key:     key,
 		Val:     val,
-		Expired: time.Time{},
+		Deleted: false,
 	}
-	local = append(local, add)
+	id := uuid.NewUUID().String()
+	local[id] = add
 	mtx.Unlock()
 
-	b, err := json.Marshal([]update{
-		{
-			Action: "add",
-			Data:   []entry{add},
-		},
+	b, err := json.Marshal(update{
+		Action: "add",
+		Data: []state{{id: add}},
 	})
 
 	if err != nil {
@@ -197,21 +193,20 @@ func addHandler(w http.ResponseWriter, r *http.Request) {
 func delHandler(w http.ResponseWriter, r *http.Request) {
 	_ = r.ParseForm()
 	key := r.Form.Get("key")
-	now := time.Now()
-	var deleted []entry
+	var deleted []state
 	mtx.Lock()
-	for i := range local {
-		if local[i].Key == key {
-			local[i].Expired = now
-			deleted = append(deleted, local[i])
+	for id := range local {
+		if local[id].Key == key {
+			local[id].Deleted = true
+			deleted = append(deleted, state{id: nil})
 		}
 	}
 	mtx.Unlock()
 
-	b, err := json.Marshal([]update{{
+	b, err := json.Marshal(update{
 		Action: "del",
 		Data:   deleted,
-	}})
+	})
 
 	if err != nil {
 		http.Error(w, err.Error(), 500)
@@ -228,16 +223,22 @@ func getHandler(w http.ResponseWriter, r *http.Request) {
 	key := r.Form.Get("key")
 	var val []string
 	mtx.RLock()
-	for i := range local {
-		if local[i].Key == key {
-			expireTime := local[i].Expired
-			if expireTime.IsZero() || expireTime.After(time.Now()) {
-				val = append(val, local[i].Val)
+	for _, entry := range local {
+		if entry.Key == key {
+			if !entry.Deleted {
+				val = append(val, entry.Val)
 			}
 		}
 	}
 	mtx.RUnlock()
 	_, _ = w.Write([]byte(strings.Join(val, ",")))
+}
+
+type logOutput struct {}
+
+func (l *logOutput) Write(p []byte) (n int, err error) {
+	log.Debug(string(p))
+	return len(p), nil
 }
 
 func start() (*memberlist.Memberlist, error) {
@@ -249,53 +250,68 @@ func start() (*memberlist.Memberlist, error) {
 	c.AdvertiseAddr = os.Getenv("POD_IP")
 	c.AdvertisePort = 33333
 	c.Name = hostname + "-" + uuid.NewUUID().String()
-	c.GossipInterval = time.Millisecond * 200
-	c.GossipNodes = 3
+	c.LogOutput = &logOutput{}
 	m, err := memberlist.Create(c)
 	if err != nil {
 		return m, err
 	}
-	if len(*members) > 0 {
-		parts := strings.Split(*members, ",")
-		_, err := m.Join(parts)
-		if err != nil {
-			return m, err
-		}
-	}
-	broadcasts = &memberlist.TransmitLimitedQueue{
+
+	broadcasts = memberlist.TransmitLimitedQueue{
 		NumNodes: func() int {
 			return m.NumMembers()
 		},
 		RetransmitMult: 3,
 	}
+
+	if len(*members) > 0 {
+		for {
+			time.Sleep(time.Second * 3)
+			parts := strings.Split(*members, ",")
+			_, err := m.Join(parts)
+			if err == nil {
+				break
+			}
+		}
+	}
+
 	node := m.LocalNode()
-	fmt.Printf("Local member %s:%d\n", node.Addr, node.Port)
+	log.Debugf("local member %s:%d\n", node.Addr, node.Port)
 	return m, nil
 }
 
 func main() {
 	_, err := start()
 	if err != nil {
-		fmt.Println(err)
+		log.Error(err)
 	}
-	go printMembersStatus()
+
+	go gc()
 
 	http.HandleFunc("/add", addHandler)
 	http.HandleFunc("/del", delHandler)
 	http.HandleFunc("/get", getHandler)
 	if err := http.ListenAndServe(":4396", nil); err != nil {
-		fmt.Println(err)
+		log.Panic(err)
 	}
 }
 
-func printMembersStatus() {
-	tick := time.NewTicker(time.Second * 10)
+func gc() {
+	tick := time.NewTicker(time.Minute * 15)
+	defer tick.Stop()
 	for {
 		select {
 		case <-tick.C:
-			fmt.Println(strings.Repeat("#", 50))
-			fmt.Println(local)
-			fmt.Println(strings.Repeat("#", 50))
+			log.Info("start gc")
+			mtx.Lock()
+			l1 := len(local)
+			for i := range local {
+				if local[i].Deleted {
+					delete(local, i)
+				}
+			}
+			l2 := len(local)
+			log.Debugf("complete gc, delete %d entry", l1 - l2)
+			mtx.Unlock()
 		}
 	}
 }

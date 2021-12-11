@@ -24,7 +24,7 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: status.podIP
-          image: kaynwong/memberlist:latest
+          image: ccr.ccs.tencentyun.com/kayn-infra/gossip:latest
           imagePullPolicy: Always
           name: memberlist
       restartPolicy: Always
